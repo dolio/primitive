@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP, MagicHash, UnboxedTuples, UnliftedFFITypes, DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- |
 -- Module      : Data.Primitive.ByteArray
@@ -34,6 +36,7 @@ module Data.Primitive.ByteArray (
 ) where
 
 import Control.Monad.Primitive
+import Control.Monad.ST
 import Data.Primitive.Types
 
 import Foreign.C.Types
@@ -47,6 +50,15 @@ import GHC.Prim
 import Data.Typeable ( Typeable )
 import Data.Data ( Data(..) )
 import Data.Primitive.Internal.Compat ( isTrue#, mkNoRepType )
+import Data.Function
+
+#if MIN_VERSION_base(4,7,0)
+import GHC.Exts (IsList(..))
+#endif
+
+#if !(MIN_VERSION_base(4,8,0))
+import Data.Monoid
+#endif
 
 -- | Byte arrays
 data ByteArray = ByteArray ByteArray# deriving ( Typeable )
@@ -252,6 +264,65 @@ foreign import ccall unsafe "primitive-memops.h hsprimitive_memmove"
   memmove_mba :: MutableByteArray# s -> CInt
               -> MutableByteArray# s -> CInt
               -> CSize -> IO ()
+
+emptyByteArray :: ByteArray
+emptyByteArray = runST $ newByteArray 0 >>= unsafeFreezeByteArray
+{-# NOINLINE emptyByteArray #-}
+
+createByteArray
+  :: Int -> (forall s. MutableByteArray s -> ST s ()) -> ByteArray
+createByteArray 0  _   = emptyByteArray
+createByteArray sz act = runST $ do
+  ba <- newByteArray sz
+  act ba
+  unsafeFreezeByteArray ba
+{-# INLINE createByteArray #-}
+
+(?) :: (a -> b -> c) -> (b -> a -> c)
+(?) = flip
+{-# INLINE (?) #-}
+
+instance Eq ByteArray where
+  ba1 == ba2 = sz == sizeofByteArray ba2 && go 0
+   where
+   sz = sizeofByteArray ba1
+   index :: ByteArray -> Int -> Word8
+   index = indexByteArray
+   go i | i < sz = index ba1 i == index ba2 i && go (i+1)
+        | otherwise = True
+  {-# INLINE (==) #-}
+
+instance Eq (MutableByteArray s) where
+  (==) = sameMutableByteArray
+  {-# INLINE (==) #-}
+
+instance Monoid ByteArray where
+  mempty = emptyByteArray
+  mappend ba1 ba2 = createByteArray sz $ \br ->
+    copyByteArray br 0 ba1 0 sz1 >> copyByteArray br sz1 ba2 0 sz2
+   where
+   sz1 = sizeofByteArray ba1
+   sz2 = sizeofByteArray ba2
+   sz = sz1 + sz2
+
+  mconcat bas = createByteArray sz $ \br ->
+    fix ? 0 ? bas $ \loop off l -> case l of
+      ba:stk -> copyByteArray br off ba 0 sza >> loop (off+sza) stk
+       where sza = sizeofByteArray ba
+      [] -> return ()
+   where
+   sz = sum . map sizeofByteArray $ bas
+
+#if MIN_VERSION_base(4,7,0)
+instance IsList ByteArray where
+  type Item ByteArray = Word8
+  fromListN n l = createByteArray n $ \br ->
+    fix ? 0 ? l $ \loop off l' -> case l' of
+      b:bs -> writeByteArray br off b >> loop (off+1) bs
+      [  ] -> return ()
+  fromList l = fromListN (length l) l
+  toList ba = map (indexByteArray ba) [0 .. sizeofByteArray ba]
+#endif
 
 instance Data ByteArray where
   toConstr _ = error "toConstr"
